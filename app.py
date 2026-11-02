@@ -10,9 +10,11 @@ import plotly.graph_objects as go
 st.set_page_config(page_title="scFv Developability", layout="wide")
 st.title("🧬 scFv Variant Developability Pipeline")
 
-# Initialize session state for synchronized campaign/run name
-if 'campaign_name' not in st.session_state:
-    st.session_state.campaign_name = "Target_Design_01"
+# Initialize session state keys for widgets
+if 'p1_name' not in st.session_state:
+    st.session_state.p1_name = "Target_Design_01"
+if 'p2_name' not in st.session_state:
+    st.session_state.p2_name = "Target_Design_01"
 
 # Initialize session state for storing Phase 2 results
 if 'scored_df' not in st.session_state:
@@ -21,12 +23,12 @@ if 'scored_df' not in st.session_state:
 # Set up the two phases as distinct tabs
 tab1, tab2 = st.tabs(["Phase 1: Generation", "Phase 2: Evaluation"])
 
-# Callback functions to synchronize Tab 1 and Tab 2 text fields
+# Callback functions to synchronize Tab 1 and Tab 2 text fields directly via state keys
 def sync_p1_to_p2():
-    st.session_state.campaign_name = st.session_state.p1_name
+    st.session_state.p2_name = st.session_state.p1_name
 
 def sync_p2_to_p1():
-    st.session_state.campaign_name = st.session_state.p2_name
+    st.session_state.p1_name = st.session_state.p2_name
 
 # ==========================================
 # TAB 1: PHASE 1 (Generation)
@@ -40,7 +42,6 @@ with tab1:
         # Linked campaign name text field
         run_name = st.text_input(
             "Sequence / Campaign Name", 
-            value=st.session_state.campaign_name, 
             key="p1_name", 
             on_change=sync_p1_to_p2
         )
@@ -412,7 +413,6 @@ with tab2:
         # Linked campaign name text field with Tab 2 Key and Callback
         p2_run_name = st.text_input(
             "Sequence Name (Processed in Phase 1)", 
-            value=st.session_state.campaign_name, 
             key="p2_name", 
             on_change=sync_p2_to_p1
         )
