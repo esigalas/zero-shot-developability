@@ -31,8 +31,16 @@ def main():
     model = AutoModelForMaskedLM.from_pretrained(hf_id).eval()
     mask_token_id = tokenizer.mask_token_id
     
-    if torch.cuda.is_available():
-        model = model.cuda()
+    # 1. Check available VRAM or use half-precision
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    try:
+        # Load in half-precision (bfloat16 or float16) to cut VRAM footprint from ~2.5 GB to ~1.2 GB
+        model = model.to(device=device, dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16)
+    except torch.OutOfMemoryError:
+        print(" -> GPU OOM detected. Falling back to CPU execution for ESM-C...")
+        torch.cuda.empty_cache()
+        model = model.to("cpu", dtype=torch.float32)
     
     inputs = tokenizer(clean_wt, return_tensors="pt")
     if torch.cuda.is_available():

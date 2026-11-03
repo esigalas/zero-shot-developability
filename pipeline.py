@@ -478,8 +478,11 @@ def run_universal_developability_pipeline(
         with open(unrelaxed_pdb_path, "w") as f:
             f.write("\n".join(fixed_pdb))
             
-        del model
-        torch.cuda.empty_cache()
+        del model, tokenizer, tokenized_input, output, float32_output
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
 
     # ---------------------------------------------------------
     # STEP 3: Constrained Relaxation (PyRosetta)
