@@ -20,6 +20,15 @@ from pyrosetta.rosetta.protocols.relax import FastRelax
 from pyrosetta.rosetta.core.scoring import ScoreFunctionFactory
 from Bio.SeqUtils.ProtParam import ProteinAnalysis
 
+# =====================================================================
+# GLOBAL PATHS & ENVIRONMENT CONFIGURATION (Edit These For Your Setup)
+# =====================================================================
+PROTEIN_MPNN_SCRIPT = "/home/esigalas/workspace/ProteinMPNN/protein_mpnn_run.py"
+THERMO_MPNN_SCRIPT = "/home/esigalas/workspace/ThermoMPNN/analysis/custom_inference.py"
+JANUS_SRC_PATH = "/home/esigalas/workspace/JanusDDG/src"
+JANUS_MODELS_DIR = "/home/esigalas/workspace/JanusDDG/models"
+ESMC_CONDA_ENV = "esmc_env"
+
 _PYROSETTA_INITIALIZED = False
 
 def safe_init_pyrosetta():
@@ -629,7 +638,6 @@ def run_universal_developability_pipeline(
     if "ProteinMPNN (Diverse)" in gen_models:
         print(f" -> Running ProteinMPNN at Temperature {temp} on chains ({mpnn_chains_str})...")
         mpnn_out_dir = os.path.join(run_dir, "mpnn_out")
-        PROTEIN_MPNN_SCRIPT = "/home/esigalas/workspace/ProteinMPNN/protein_mpnn_run.py"
         
         if not os.path.exists(PROTEIN_MPNN_SCRIPT):
             st.error(f"Could not find ProteinMPNN at {PROTEIN_MPNN_SCRIPT}.")
@@ -675,7 +683,6 @@ def run_universal_developability_pipeline(
     # --- MODEL C: ThermoMPNN (ddG-Driven Single + Multi-Mutant Combos) ---
     if "ThermoMPNN (ddG-Driven)" in gen_models:
         print(f" -> Running ThermoMPNN ddG Generator on chains ({thermo_chains_str})...")
-        THERMO_MPNN_SCRIPT = "/home/esigalas/workspace/ThermoMPNN/analysis/custom_inference.py"
         
         if not os.path.exists(THERMO_MPNN_SCRIPT):
             st.error(f"Could not find ThermoMPNN at {THERMO_MPNN_SCRIPT}.")
@@ -742,7 +749,6 @@ def run_universal_developability_pipeline(
     if "ProteinMPNN (Soluble)" in gen_models:
         print(f" -> Running ProteinMPNN (Soluble Model) at Temperature {temp} on chains ({mpnn_chains_str})...")
         soluble_out_dir = os.path.join(run_dir, "soluble_mpnn_out")
-        PROTEIN_MPNN_SCRIPT = "/home/esigalas/workspace/ProteinMPNN/protein_mpnn_run.py"
         
         soluble_cmd = [
             "python", PROTEIN_MPNN_SCRIPT,
@@ -790,7 +796,7 @@ def run_universal_developability_pipeline(
         omit_set = set(omit_aas or [])
         
         esmc_cmd = [
-            "conda", "run", "-n", "esmc_env", 
+            "conda", "run", "-n", ESMC_CONDA_ENV, 
             "python", "run_esmc_dms.py",
             "--sequence", clean_wt_full,
             "--cdr_indices", cdr_str,
@@ -1547,7 +1553,7 @@ def score_universal_variants(run_dir: str, run_name: str, wt_sequence: str):
         df.loc[mask, ['id', 'mutations']].to_csv(temp_in_csv, index=False)
         
         esmc_score_cmd = [
-            "conda", "run", "-n", "esmc_env",
+            "conda", "run", "-n", ESMC_CONDA_ENV,
             "python", "run_esmc_scoring.py",
             "--wt_seq", clean_wt,
             "--input_csv", temp_in_csv,
@@ -1576,12 +1582,11 @@ def score_universal_variants(run_dir: str, run_name: str, wt_sequence: str):
     
     if mask.any():
         print(f"Running JanusDDG for {mask.sum()} missing variants...")
-        janus_src_path = "/home/esigalas/workspace/JanusDDG/src" 
-        if janus_src_path not in sys.path:
-            sys.path.append(janus_src_path)
+        if JANUS_SRC_PATH not in sys.path:
+            sys.path.append(JANUS_SRC_PATH)
         try:
             import utils
-            utils.MODELS_DIR = "/home/esigalas/workspace/JanusDDG/models" 
+            utils.MODELS_DIR = JANUS_MODELS_DIR
             
             temp_csv_path = os.path.join(run_dir, "temp_janus_input.csv")
             subset_to_compute = df[mask & (df['mutations'] != "WT")]
