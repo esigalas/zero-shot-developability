@@ -27,7 +27,7 @@ PROTEIN_MPNN_SCRIPT = "/home/esigalas/workspace/ProteinMPNN/protein_mpnn_run.py"
 THERMO_MPNN_SCRIPT = "/home/esigalas/workspace/ThermoMPNN/analysis/custom_inference.py"
 JANUS_SRC_PATH = "/home/esigalas/workspace/JanusDDG/src"
 JANUS_MODELS_DIR = "/home/esigalas/workspace/JanusDDG/models"
-ESMC_CONDA_ENV = "esmc_env"
+ESMC_CONDA_ENV = "esmc_env2"
 
 _PYROSETTA_INITIALIZED = False
 
@@ -1615,7 +1615,16 @@ def score_universal_variants(run_dir: str, run_name: str, wt_sequence: str):
                 setattr(__main__, 'TransformerRegression', janus_model.TransformerRegression)
                 setattr(__main__, 'SinusoidalPositionalEncoding', janus_model.SinusoidalPositionalEncoding)
 
-                model_janus = utils.load_model('JanusDDG_fine_tuned.pth', device)
+                # --- PyTorch 2.6+ Compatibility Fix ---
+                _orig_load = torch.load
+                try:
+                    # Temporarily force weights_only=False for the trusted local checkpoint
+                    torch.load = lambda *args, **kwargs: _orig_load(*args, **{**kwargs, 'weights_only': False})
+                    model_janus = utils.load_model('JanusDDG_fine_tuned.pth', device)
+                finally:
+                    # Restore original torch.load behavior
+                    torch.load = _orig_load
+                # ---------------------------------------
                 pred_dir, _ = utils.process_and_predict(temp_csv_path, model_janus, model_esm, batch_converter_esm, device)
                 
                 janus_mapping = dict(zip(subset_to_compute['id'], pred_dir.values))
