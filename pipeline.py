@@ -27,7 +27,7 @@ PROTEIN_MPNN_SCRIPT = "/home/esigalas/workspace/ProteinMPNN/protein_mpnn_run.py"
 THERMO_MPNN_SCRIPT = "/home/esigalas/workspace/ThermoMPNN/analysis/custom_inference.py"
 JANUS_SRC_PATH = "/home/esigalas/workspace/JanusDDG/src"
 JANUS_MODELS_DIR = "/home/esigalas/workspace/JanusDDG/models"
-ESMC_CONDA_ENV = "esmc_env2"
+ESMC_CONDA_ENV = "esmc_env"
 
 _PYROSETTA_INITIALIZED = False
 
