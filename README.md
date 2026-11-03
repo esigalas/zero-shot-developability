@@ -6,6 +6,88 @@ The pipeline strictly decouples **variant generation (Phase 1)** from **biophysi
 
 ---
 
+## ⚙️ Installation & Environment Setup
+
+Follow these steps to set up the dual conda environments, clone external physics engines, and configure your local workspace paths.
+
+### 1. Clone the Main Repository
+First, clone this repository to your local system and change into the project directory:
+```bash
+git clone git@github.com:esigalas/zero-shot-developability.git
+cd zero-shot-developability
+```
+
+### 2. Set Up Dual Conda Environments
+To optimize memory footprints, library compatibility, and isolated execution, the pipeline splits model dependencies into two distinct conda environments:
+
+*   **Environment 1: The Main Pipeline Environment (`environment_main.yml`)**
+    This acts as the principal environment where you launch the Streamlit app and execute all structural scoring scripts (except for ESM-C DMS and scoring).
+    ```bash
+    # Create the environment from the config file
+    conda env create -n zero-shot-env -f environment_main.yml
+    
+    # Activate the principal environment
+    conda activate developability_pipeline
+    ```
+
+*   **Environment 2: Isolated ESM-C Environment (`environment_esmc.yml`)**
+    This environment is dedicated to running ESM-C predictions (which operate in isolated subprocess calls under `run_esmc_dms.py` and `run_esmc_scoring.py` to prevent library and memory conflicts with PyRosetta).
+    ```bash
+    # Create the isolated ESM-C environment
+    conda env create -n esmc_env -f environment_esmc.yml
+    ```
+
+---
+
+### 3. Clone External Dependencies
+To run Phase 1 generative models and Phase 2 scoring metrics, you must clone three external third-party repositories into your workspace directory. Run these clone commands in your workspace:
+
+1.  **ThermoMPNN** (Phase 1 generative ΔΔG scanning model):
+    ```bash
+    git clone https://github.com/Kuhlman-Lab/ThermoMPNN.git
+    ```
+2.  **ProteinMPNN** (Phase 1 GNN inverse-folding model):
+    ```bash
+    git clone https://github.com/dauparas/ProteinMPNN.git
+    ```
+3.  **JanusDDG** (Phase 2 sequence-level thermodynamic scoring model):
+    ```bash
+    git clone git@github.com:compbiomed-unito/JanusDDG.git
+    ```
+
+---
+
+### 4. Configure Local Workspace Paths in `pipeline.py`
+Open `pipeline.py` and configure the static variables at the top of the file to point to your local installation directories and conda environment names:
+
+```python
+# =====================================================================
+# GLOBAL PATHS & ENVIRONMENT CONFIGURATION (Edit These For Your Setup)
+# =====================================================================
+PROTEIN_MPNN_SCRIPT = "/home/esigalas/workspace/ProteinMPNN/protein_mpnn_run.py"
+THERMO_MPNN_SCRIPT  = "/home/esigalas/workspace/ThermoMPNN/analysis/custom_inference.py"
+JANUS_SRC_PATH      = "/home/esigalas/workspace/JanusDDG/src"
+JANUS_MODELS_DIR    = "/home/esigalas/workspace/JanusDDG/models"
+ESMC_CONDA_ENV      = "esmc_env"
+```
+
+*Ensure these absolute paths match where you cloned the repositories in Step 3.*
+
+---
+
+### 5. Launch the Web App
+Once your environments are built and your paths are configured, activate your main pipeline environment and start the Streamlit interface:
+
+```bash
+# Make sure you are in your main environment
+conda activate zero-shot-env
+
+# Start the web app
+streamlit run app.py
+```
+
+---
+
 ## ✨ Key Features & Supported Formats
 
 * **Universal Multi-Chain Format Support:**
@@ -173,12 +255,3 @@ All candidates passing all three gates (`passed_all_gates == True`, `gate_status
   * **Interactive Anti-Aggregation Multi-Gate Filter:** Live sliders (`max_rosetta = +10.0 REU`, `min_janus = -0.5 kcal/mol`, `min_ablang = -1.0 ΔLL`, `min_esm = -10.0 ΔLL`) and WT-relative checkboxes (`GRAVY <= WT`, `CamSol >= WT`, `BINDPRED <= WT`, `Charge Dipole <= WT`).
   * **4D Developability Scatter Landscape & Normalized Radar Footprint:** Interactive Plotly charts with WT baseline crosshairs and `[0, 1]` min-max normalized multi-spoke footprints.
 
-### 2. Standalone Prospective Triage & 2×2 Jaccard Diagnostics (`prospective_campaign_triage.py`)
-
-To prepare the final wet-lab synthesis plate (e.g., Top 20 variants), the triage script performs:
-
-* **Greedy Jaccard Diversity Pruning (`MAX_MUTATION_JACCARD = 0.40`):** Iterates down the gate-passing rank list and rejects any candidate sharing `> 40%` mutational overlap with an already-selected lead, preventing a single dominant point mutation from monopolizing the synthesis plate.
-* **Exact Substitution Jaccard ($J_{\text{mut}}$) vs. Residue-Position Jaccard ($J_{\text{pos}}$):**
-  * $J_{\text{mut}}$ compares exact amino acid tokens (e.g., `{'Y50S', 'E223T'}`).
-  * $J_{\text{pos}}$ compares mutated residue positions regardless of the replacement amino acid (e.g., `{'Y50', 'E223'}`), exposing hidden cross-generator structural hotspot convergence and highlighting where shortlisted leads test alternative side-chain chemistries at the same 3D site.
-* **In-Silico `nDCG@20` Regime Diagnostic:** Read-only console diagnostic measuring top-of-funnel alignment between 1D `esmc_fitness` and the 3D physical anchor (`-0.5 * Z_PyRosetta - 0.5 * Z_ΔBINDPRED`).
