@@ -27,7 +27,7 @@ To optimize memory footprints, library compatibility, and isolated execution, th
     conda env create -n zero-shot-env -f environment_main.yml
     
     # Activate the principal environment
-    conda activate developability_pipeline
+    conda activate zero-shot-env
     ```
 
 *   **Environment 2: Isolated ESM-C Environment (`environment_esmc.yml`)**
