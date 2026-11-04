@@ -619,8 +619,10 @@ def run_universal_developability_pipeline(
                             af_records.append(SeqRecord(Seq(s_full), id=f"AntiFold_sample{sample_idx}", description=""))
                             sample_idx += 1
                         os.remove(af_fasta)
+                    else:
+                        print(f" -> WARNING: AntiFold produced no FASTA file!\nSTDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}")
                 except subprocess.CalledProcessError as e:
-                    print(f" -> WARNING: AntiFold failed on chain {ch_heavy}: {e.stderr}")
+                    print(f" -> WARNING: AntiFold failed on chain {ch_heavy}:\nSTDOUT:\n{e.stdout}\nSTDERR:\n{e.stderr}")
 
             if af_records:
                 SeqIO.write(af_records, os.path.join(run_dir, f"{run_name}_antifold.fasta"), "fasta")
