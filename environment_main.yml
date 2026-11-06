@@ -1,4 +1,4 @@
-name: zero-shot-env-pure
+name: zero-shot-pipeline
 channels:
   - defaults
   - conda-forge
