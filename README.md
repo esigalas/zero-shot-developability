@@ -89,7 +89,7 @@ Once your environments are built and your paths are configured, activate your ma
 
 ```bash
 # Make sure you are in your main environment
-conda activate zero-shot-env
+conda activate zero-shot-pipeline
 
 # Start the web app
 streamlit run app.py
