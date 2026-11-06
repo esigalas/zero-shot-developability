@@ -24,10 +24,10 @@ To optimize memory footprints, library compatibility, and isolated execution, th
     This acts as the principal environment where you launch the Streamlit app and execute all structural scoring scripts (except for ESM-C DMS and scoring).
     ```bash
     # Create the environment from the config file
-    conda env create -n zero-shot-env -f environment_main.yml
+    conda env create -f environment_main.yml
     
     # Activate the principal environment
-    conda activate zero-shot-env
+    conda activate zero-shot-pipeline
 
     # Install antifold python module separately with no dependencies
     pip install antifold==0.2.3 --no-deps
