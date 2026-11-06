@@ -28,6 +28,15 @@ To optimize memory footprints, library compatibility, and isolated execution, th
     
     # Activate the principal environment
     conda activate zero-shot-env
+
+    # Install antifold python module separately with no dependencies
+    pip install antifold==0.2.3 --no-deps
+
+    # 1. Alias 'filter_backbone' in biotite for ESM-IF1 and AntiFold compatibility
+    python -c "import biotite.structure as bs, pathlib; p = pathlib.Path(bs.__file__); txt = p.read_text(); p.write_text(txt + '\n# Backwards compatibility for AntiFold and ESM-IF1\nfilter_backbone = filter_peptide_backbone\n') if 'filter_backbone = filter_peptide_backbone' not in txt else None; print('✅ Biotite patched!')"
+
+    # 2. Pre-download AntiFold weights to bypass the auto-download bug in antifold >= 1.0.1
+    python -c "import os, urllib.request, antifold; d = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(antifold.__file__))), 'models'); os.makedirs(d, exist_ok=True); urllib.request.urlretrieve('[https://opig.stats.ox.ac.uk/data/downloads/AntiFold/models/model.pt](https://opig.stats.ox.ac.uk/data/downloads/AntiFold/models/model.pt)', os.path.join(d, 'model.pt')); print('✅ AntiFold weights ready!')"
     ```
 
 *   **Environment 2: Isolated ESM-C Environment (`environment_esmc.yml`)**
