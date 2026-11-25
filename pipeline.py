@@ -1057,13 +1057,32 @@ def score_universal_variants(run_dir: str, run_name: str, wt_sequence: str):
                     mutations.append(f"{wt_aa}{idx+1}{mut_aa}")
             mut_string = ",".join(mutations) if mutations else "WT"
             
-        variants.append({
+        variant_entry = {
             "id": unique_id, 
             "mutations": mut_string, 
             "full_sequence": seq,
             "VH": vh_seq,
             "VL": vl_seq
-        })
+        }
+        
+        # Calculate per-chain local mutations dynamically (1-indexed starting at 1 per chain)
+        for c_id, (s_idx, e_idx, role) in chain_bounds.items():
+            wt_c_seq = clean_wt[s_idx:e_idx]
+            mut_c_seq = seq[s_idx:e_idx]
+            
+            c_mutations = []
+            if mut_c_seq == wt_c_seq:
+                c_mut_string = "WT"
+            else:
+                for idx, (wt_aa, mut_aa) in enumerate(zip(wt_c_seq, mut_c_seq)):
+                    if wt_aa != mut_aa:
+                        c_mutations.append(f"{wt_aa}{idx+1}{mut_aa}")
+                c_mut_string = ",".join(c_mutations) if c_mutations else "WT"
+                
+            role_suffix = str(role).strip() if role else str(c_id)
+            variant_entry[f"mutations_{role_suffix}"] = c_mut_string
+            
+        variants.append(variant_entry)
 
     df = pd.DataFrame(variants)
 
@@ -1790,7 +1809,7 @@ def score_universal_variants(run_dir: str, run_name: str, wt_sequence: str):
         'ablang_fitness', 'protbert_fitness', 'poet2_fitness', 'esmc_fitness', 'full_sequence'
     ]
     cols_to_save = [c for c in ordered_cols if c in df.columns] + [
-        c for c in df.columns if c.endswith('_norm') or c in ['VH', 'VL']
+        c for c in df.columns if c.endswith('_norm') or c.startswith('mutations_') or c in ['VH', 'VL']
     ]
     
     df[cols_to_save].to_csv(final_csv_path, index=False)
