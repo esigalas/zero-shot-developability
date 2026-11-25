@@ -1802,7 +1802,7 @@ def score_universal_variants(run_dir: str, run_name: str, wt_sequence: str):
     
     # 5. Clean up columns for the final CSV layout
     ordered_cols = [
-        'id', 'source_model', 'mutations', 'protein_format', 'num_mutations',
+        'id', 'source_model', 'protein_format', 'num_mutations',
         'agnostic_gated_score', 'global_composite_score', 'passed_all_gates', 'gate_status',
         'janus_ddg', 'pyrosetta_ddg', 'camsol_score', 'pI', 'pi_delta', 'gravy', 'net_charge',
         'charge_asymmetry', 'bindpred_kd', 'esm_fitness', 'antiberty_fitness', 
