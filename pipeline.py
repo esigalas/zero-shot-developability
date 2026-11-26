@@ -1,4 +1,7 @@
 import os
+os.environ["TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"] = "1"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 import sys
 import threading
 import streamlit as st
@@ -31,22 +34,23 @@ ESMC_CONDA_ENV = "esmc_env"
 
 _PYROSETTA_INITIALIZED = False
 
+
 def safe_init_pyrosetta():
     """
     Ensures PyRosetta is initialized exactly once per Streamlit worker thread.
     Required for the cxx11thread build, which uses thread-local singletons.
     """
-    # Create a persistent set attached to the sys module to survive Streamlit reloads
     if not hasattr(sys, '_PYROSETTA_INIT_THREADS'):
         sys._PYROSETTA_INIT_THREADS = set()
-        
+
     thread_id = threading.get_ident()
-    
+
     # Check if the current specific thread has initialized PyRosetta
     if thread_id not in sys._PYROSETTA_INIT_THREADS:
         import pyrosetta
         pyrosetta.init("-relax:constrain_relax_to_start_coords -ex1 -ex2 -use_input_sc -mute all")
         sys._PYROSETTA_INIT_THREADS.add(thread_id)
+
 
 # =====================================================================
 # FORMAT-SPECIFIC COMPOSITE SCORE WEIGHTS (Easy to Tune After Benchmarking)
@@ -113,6 +117,7 @@ FORMAT_WEIGHTS = {
         "gravy_norm": 0.10
     }
 }
+
 
 def parse_custom_fixed_string(custom_str: str, chain_lengths: dict) -> dict:
     """
@@ -226,7 +231,14 @@ def build_unified_frozen_positions(
     return fixed_positions_map, antifold_mutable_regions_str
 
 
-def enforce_mutation_cap_and_filters(candidate_seq: str, wt_seq: str, global_frozen_1idx: set, omit_aas: list, max_muts_per_seq: int, rng: np.random.Generator) -> str:
+def enforce_mutation_cap_and_filters(
+    candidate_seq: str,
+    wt_seq: str,
+    global_frozen_1idx: set,
+    omit_aas: list,
+    max_muts_per_seq: int,
+    rng: np.random.Generator
+) -> str:
     """
     1. Reverts any mutation at a frozen position or into a banned amino acid (omit_aas).
     2. If the remaining mutation count exceeds max_muts_per_seq (e.g., from AntiFold/MPNN),
@@ -257,7 +269,15 @@ def enforce_mutation_cap_and_filters(candidate_seq: str, wt_seq: str, global_fro
 
     return "".join(cand_list)
 
-def build_single_and_combo_records(sorted_single_muts: list, clean_wt_full: str, model_prefix: str, num_seqs: int, max_muts_per_seq: int, rng: np.random.Generator) -> list:
+
+def build_single_and_combo_records(
+    sorted_single_muts: list,
+    clean_wt_full: str,
+    model_prefix: str,
+    num_seqs: int,
+    max_muts_per_seq: int,
+    rng: np.random.Generator
+) -> list:
     """
     Used by ThermoMPNN, ESM-C, and AbLang2:
       - First half of num_seqs: top single-point mutations (1 mutation each)
@@ -299,14 +319,14 @@ def build_single_and_combo_records(sorted_single_muts: list, clean_wt_full: str,
             k = int(rng.integers(2, max_k + 1))
             chosen_indices = rng.choice(len(pool), size=k, replace=False)
             chosen = sorted([pool[idx] for idx in chosen_indices], key=lambda x: x.get('global_pos', x.get('pos')))
-            
+
             mut_seq = list(clean_wt_full)
             tags = []
             for m in chosen:
                 pos = m.get('global_pos', m.get('pos'))
                 mut_seq[pos] = m['mut_aa']
                 tags.append(f"{m['wt_aa']}{pos+1}{m['mut_aa']}")
-                
+
             records.append(SeqRecord(
                 Seq("".join(mut_seq)),
                 id=f"{model_prefix}_combo{k}mut_{'-'.join(tags)}_c{c_idx+1}",
@@ -315,14 +335,81 @@ def build_single_and_combo_records(sorted_single_muts: list, clean_wt_full: str,
 
     return records
 
+
+def _get_ablang_aa_map(ablang_model, prob_dim: int) -> dict:
+    """
+    Maps the 20 standard amino acids to their exact column indices in AbLang2's
+    mode='probability' output, whether the output has 20 AA columns or full vocab size.
+    """
+    std_aas = list("ACDEFGHIKLMNPQRSTVWY")
+    tok = getattr(ablang_model, "tokenizer", None)
+    aa_to_tok = getattr(tok, "aa_to_token", None) if tok is not None else None
+    if isinstance(aa_to_tok, dict):
+        if prob_dim == len(aa_to_tok):
+            return {aa: aa_to_tok[aa] for aa in std_aas if aa in aa_to_tok}
+        if prob_dim == 20:
+            ordered_20 = sorted(
+                [aa for aa in std_aas if aa in aa_to_tok],
+                key=lambda a: aa_to_tok[a]
+            )
+            if len(ordered_20) == 20:
+                return {aa: idx for idx, aa in enumerate(ordered_20)}
+    return {aa: idx for idx, aa in enumerate(std_aas)}
+
+
+def _get_ablang_mask_index(
+    ablang_model,
+    masked_pair: list,
+    res_len: int,
+    is_light: bool,
+    local_pos: int,
+    h_len: int,
+    l_len: int
+) -> int:
+    """
+    Finds the exact token index of the '*' mask character in AbLang2's output array,
+    accounting for special tokens (<, >, |) dynamically.
+    """
+    tok = getattr(ablang_model, "tokenizer", None)
+    if tok is not None:
+        aa_to_tok = getattr(tok, "aa_to_token", {})
+        mask_id = aa_to_tok.get("*", None) if isinstance(aa_to_tok, dict) else None
+        if mask_id is not None:
+            joined = f"{masked_pair[0]}|{masked_pair[1]}"
+            for candidate_in in ([joined], [masked_pair]):
+                try:
+                    tok_out = tok(candidate_in, w_extra_tkns=True)
+                    tok_ids = tok_out[0].tolist() if hasattr(tok_out[0], "tolist") else list(tok_out[0])
+                    if mask_id in tok_ids:
+                        m_idx = tok_ids.index(mask_id)
+                        if len(tok_ids) == res_len:
+                            return m_idx
+                        if len(tok_ids) == res_len + 2 and m_idx > 0:
+                            return m_idx - 1
+                except Exception:
+                    continue
+
+    # Fallback heuristic based on total extra special tokens
+    extra = res_len - (h_len + l_len)
+    if not is_light:
+        return local_pos + (1 if extra >= 2 else 0)
+    if extra == 5:      # <VH>|<VL>
+        return h_len + 4 + local_pos
+    if extra == 3:      # <VH|VL>
+        return h_len + 2 + local_pos
+    if extra == 1:      # VH|VL
+        return h_len + 1 + local_pos
+    return h_len + local_pos
+
+
 def run_universal_developability_pipeline(
-    chains: dict, 
-    chain_roles: dict, 
-    base_output_dir: str, 
-    run_name: str, 
+    chains: dict,
+    chain_roles: dict,
+    base_output_dir: str,
+    run_name: str,
     protein_format: str,
-    gen_models: list = None, 
-    num_seqs: int = 100, 
+    gen_models: list = None,
+    num_seqs: int = 100,
     temp: float = 0.2,
     frozen_imgt_regions: list = None,
     custom_fixed_residues: str = "",
@@ -330,12 +417,14 @@ def run_universal_developability_pipeline(
     omit_aas: list = None,
     max_muts_per_seq: int = 5,
     mpnn_backbone_noise: float = 0.02,
-    thermo_ddg_cutoff: float = -0.3
+    thermo_ddg_cutoff: float = -0.3,
+    chain_names: dict = None
 ):
     """
     Universal Phase 1 pipeline supporting N-chain complexes, antibodies, and enzymes.
     - chains: dict of sequence strings {'A': '...', 'B': '...'}
     - chain_roles: dict mapping chain keys to roles {'A': 'VH', 'B': 'VL'} or {'A': 'Chain_A'}
+    - chain_names: optional dict preserving original FASTA headers {'A': 'VH_1', 'B': 'VL_1', ...}
     """
     if gen_models is None:
         gen_models = []
@@ -343,10 +432,12 @@ def run_universal_developability_pipeline(
         frozen_imgt_regions = ["CDR1", "CDR2", "CDR3"]
     if omit_aas is None:
         omit_aas = ["C"]
+    if chain_names is None:
+        chain_names = {c_id: str(chain_roles.get(c_id, c_id)).strip() for c_id in chains}
 
     run_dir = os.path.join(base_output_dir, run_name)
     os.makedirs(run_dir, exist_ok=True)
-    
+
     unrelaxed_pdb_path = os.path.join(run_dir, f"{run_name}_unrelaxed.pdb")
     relaxed_pdb_path = os.path.join(run_dir, f"{run_name}_relaxed.pdb")
     metadata_path = os.path.join(run_dir, f"{run_name}_metadata.json")
@@ -376,6 +467,7 @@ def run_universal_developability_pipeline(
         "protein_format": protein_format,
         "chain_lengths": chain_lengths,
         "chain_roles": chain_roles,
+        "chain_names": chain_names,
         "frozen_imgt_regions": frozen_imgt_regions,
         "custom_fixed_residues": custom_fixed_residues,
         "freeze_native_cys": freeze_native_cys,
@@ -400,46 +492,46 @@ def run_universal_developability_pipeline(
         tokenizer = AutoTokenizer.from_pretrained("facebook/esmfold_v1")
         model = EsmForProteinFolding.from_pretrained(
             "facebook/esmfold_v1",
-            torch_dtype=torch.bfloat16,
+            dtype=torch.bfloat16,
             device_map="auto"
         )
         model.trunk.set_chunk_size(64)
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
+
         # Concatenate all chains into a single continuous sequence for ESMFold
         combined_seq = "".join(chains.values())
-        
+
         tokenized_input = tokenizer(
-            combined_seq, 
-            return_tensors="pt", 
-            add_special_tokens=False, 
+            combined_seq,
+            return_tensors="pt",
+            add_special_tokens=False,
             return_token_type_ids=False
         ).to(device)
-        
+
         # Apply cumulative +512 position ID offset at each chain boundary
         seq_length = len(combined_seq)
         position_ids = torch.arange(seq_length, dtype=torch.long, device=device)
-        
+
         current_idx = 0
         for i, (chain_id, seq) in enumerate(chains.items()):
             if i > 0:
                 position_ids[current_idx:] += 512
             current_idx += len(seq)
-            
+
         tokenized_input["position_ids"] = position_ids.unsqueeze(0)
-        
+
         with torch.no_grad():
             output = model(**tokenized_input)
             float32_output = {
-                k: v.to(torch.float32) if isinstance(v, torch.Tensor) and v.dtype == torch.bfloat16 else v 
+                k: v.to(torch.float32) if isinstance(v, torch.Tensor) and v.dtype == torch.bfloat16 else v
                 for k, v in output.items()
             }
             pdb_string = model.output_to_pdb(float32_output)[0]
-            
+
         # Reassign PDB chain IDs and local residue numbering (1 to L per chain)
         pdb_lines = pdb_string.split("\n")
         fixed_pdb = []
-        
+
         # Precompute the exact ESMFold index bounds (including the +512 gap)
         chain_bounds = []
         current_offset = 0
@@ -447,37 +539,36 @@ def run_universal_developability_pipeline(
             start_idx_in_pdb = current_offset + 1
             end_idx_in_pdb = start_idx_in_pdb + len(c_seq) - 1
             chain_bounds.append((c_id, start_idx_in_pdb, end_idx_in_pdb))
-            current_offset += len(c_seq) + 512  # The +512 gap MUST be tracked here
-            
+            current_offset += len(c_seq) + 512 # The +512 gap MUST be tracked here
         previous_chain = chain_bounds[0][0]
-        
+
         for line in pdb_lines:
             if line.startswith("ATOM") or line.startswith("HETATM"):
                 res_idx_global = int(line[22:26].strip())
-                
+
                 target_chain = chain_bounds[0][0]
                 local_res = 1
-                
+
                 # Map the raw ESMFold index to the correct chain and local 1-index
                 for c_id, start_pdb, end_pdb in chain_bounds:
                     if start_pdb <= res_idx_global <= end_pdb:
                         target_chain = c_id
                         local_res = res_idx_global - start_pdb + 1
                         break
-                
+
                 # Format line with correct chain letter and 1-indexed local residue number
                 line = line[:21] + target_chain + line[22:]
                 line = line[:22] + f"{local_res:4d}" + line[26:]
-                
+
                 if target_chain != previous_chain:
                     fixed_pdb.append("TER")
                     previous_chain = target_chain
-                    
+
             fixed_pdb.append(line)
-            
+
         with open(unrelaxed_pdb_path, "w") as f:
             f.write("\n".join(fixed_pdb))
-            
+
         del model, tokenizer, tokenized_input, output, float32_output
         gc.collect()
         if torch.cuda.is_available():
@@ -495,21 +586,20 @@ def run_universal_developability_pipeline(
         import pyrosetta
         from pyrosetta.rosetta.core.scoring import ScoreFunctionFactory
         from pyrosetta.rosetta.protocols.relax import FastRelax
-        
+
         pose = pyrosetta.pose_from_file(unrelaxed_pdb_path)
         scorefxn = ScoreFunctionFactory.create_score_function("ref2015")
-        
+
         relax = FastRelax()
         relax.set_scorefxn(scorefxn)
         relax.constrain_relax_to_start_coords(True)
         relax.apply(pose)
-        
+
         pose.dump_pdb(relaxed_pdb_path)
-        
+
         # Free C++ memory
         pose.clear()
         del pose
-
 
     # ---------------------------------------------------------
     # STEP 4: Generative Ensemble (Unified Masking & Settings)
@@ -517,7 +607,7 @@ def run_universal_developability_pipeline(
     print(f"Step 4: Running Generative Ensemble: {gen_models}")
     all_raw_records = []
     rng = np.random.default_rng(seed=42)
-    
+
     clean_wt_full = "".join(chains.values())
 
     # Dynamic chain strings for N-chain compatibility (1-chain VHH/Enzyme, 2-chain Fv, 4-chain Bispecific)
@@ -558,7 +648,7 @@ def run_universal_developability_pipeline(
             sample_idx = 1
             for ch_heavy, ch_light in antibody_units:
                 len_h = len(chains[ch_heavy])
-                
+
                 if ch_light is not None:
                     print(f" -> Running AntiFold (Paired Mode: {ch_heavy}=VH, {ch_light}=VL), regions: {antifold_regions_str}")
                     antifold_cmd = [
@@ -572,7 +662,8 @@ def run_universal_developability_pipeline(
                     ]
                     expected_fastas = [
                         os.path.join(run_dir, f"{run_name}_relaxed_{ch_heavy}{ch_light}.fasta"),
-                        os.path.join(run_dir, f"{run_name}_relaxed_AB.fasta")
+                        os.path.join(run_dir, f"{run_name}_relaxed_AB.fasta"),
+                        os.path.join(run_dir, f"{run_name}_relaxed.fasta")
                     ]
                 else:
                     # Single-Domain VHH / Nanobody Mode (--nanobody_chain)
@@ -590,15 +681,21 @@ def run_universal_developability_pipeline(
                     ]
                     expected_fastas = [
                         os.path.join(run_dir, f"{run_name}_relaxed_{ch_heavy}.fasta"),
-                        os.path.join(run_dir, f"{run_name}_relaxed_A.fasta")
+                        os.path.join(run_dir, f"{run_name}_relaxed_A.fasta"),
+                        os.path.join(run_dir, f"{run_name}_relaxed.fasta")
                     ]
 
                 try:
-                    subprocess.run(antifold_cmd, check=True, capture_output=True, text=True)
+                    af_env = os.environ.copy()
+                    af_env["TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"] = "1"
+                    res = subprocess.run(antifold_cmd, check=True, capture_output=True, text=True, env=af_env)
+
                     af_fasta = next((p for p in expected_fastas if os.path.exists(p)), None)
                     if af_fasta is None:
-                        # Fallback glob for any fasta just written by AntiFold
-                        af_candidates = glob.glob(os.path.join(run_dir, f"{run_name}_relaxed_*.fasta"))
+                        af_candidates = [
+                            p for p in glob.glob(os.path.join(run_dir, f"{run_name}_relaxed*.fasta"))
+                            if not p.endswith("_camsol_upload.fasta")
+                        ]
                         af_fasta = af_candidates[0] if af_candidates else None
 
                     if af_fasta and os.path.exists(af_fasta):
@@ -631,7 +728,7 @@ def run_universal_developability_pipeline(
     # --- EXPORT UNIFIED MASKING JSONL FOR PROTEINMPNN / THERMOMPNN ---
     fixed_json_path = os.path.join(run_dir, "fixed_positions.jsonl")
     has_mpnn = any("ProteinMPNN" in m or "ThermoMPNN" in m for m in gen_models)
-    
+
     if has_mpnn:
         pdb_basename = os.path.splitext(os.path.basename(relaxed_pdb_path))[0]
         fixed_dict = {pdb_basename: fixed_positions_map}
@@ -643,11 +740,11 @@ def run_universal_developability_pipeline(
     if "ProteinMPNN (Diverse)" in gen_models:
         print(f" -> Running ProteinMPNN at Temperature {temp} on chains ({mpnn_chains_str})...")
         mpnn_out_dir = os.path.join(run_dir, "mpnn_out")
-        
+
         if not os.path.exists(PROTEIN_MPNN_SCRIPT):
             st.error(f"Could not find ProteinMPNN at {PROTEIN_MPNN_SCRIPT}.")
             raise FileNotFoundError("Missing ProteinMPNN script.")
-            
+
         mpnn_cmd = [
             "python", PROTEIN_MPNN_SCRIPT,
             "--pdb_path", relaxed_pdb_path,
@@ -677,7 +774,7 @@ def run_universal_developability_pipeline(
                     rec.description = ""
                     mpnn_records.append(rec)
                     sample_idx += 1
-                    
+
             if mpnn_records:
                 SeqIO.write(mpnn_records, os.path.join(run_dir, f"{run_name}_proteinmpnn.fasta"), "fasta")
                 all_raw_records.extend(mpnn_records)
@@ -688,21 +785,21 @@ def run_universal_developability_pipeline(
     # --- MODEL C: ThermoMPNN (ddG-Driven Single + Multi-Mutant Combos) ---
     if "ThermoMPNN (ddG-Driven)" in gen_models:
         print(f" -> Running ThermoMPNN ddG Generator on chains ({thermo_chains_str})...")
-        
+
         if not os.path.exists(THERMO_MPNN_SCRIPT):
             st.error(f"Could not find ThermoMPNN at {THERMO_MPNN_SCRIPT}.")
             st.stop()
-            
+
         pdb_basename = os.path.splitext(os.path.basename(relaxed_pdb_path))[0]
         csv_path = os.path.join(run_dir, f"ThermoMPNN_inference_{pdb_basename}.csv")
-        
+
         all_thermo_muts = []
         omit_set = set(omit_aas or [])
-        
+
         thermo_cmd = [
             "python", THERMO_MPNN_SCRIPT,
             "--pdb", relaxed_pdb_path,
-            "--chain", thermo_chains_str, 
+            "--chain", thermo_chains_str,
             "--out_dir", run_dir
         ]
         try:
@@ -712,11 +809,11 @@ def run_universal_developability_pipeline(
                 st.stop()
             df_thermo = pd.read_csv(csv_path)
             for _, row in df_thermo.iterrows():
-                pos = int(row['position']) 
+                pos = int(row['position'])
                 mut_aa = str(row['mutation']).strip()
                 ddg = float(row['ddG_pred'])
                 wt_aa = str(row['wildtype']).strip()
-                
+
                 # Safeguard if ThermoMPNN CSV uses local per-chain position instead of global 0-index
                 if 'chain' in df_thermo.columns and str(row['chain']).strip() in chain_offsets:
                     c_key = str(row['chain']).strip()
@@ -726,16 +823,16 @@ def run_universal_developability_pipeline(
                             pos = cand_global
 
                 if pos in combined_frozen_0idx or mut_aa in omit_set:
-                    continue 
+                    continue
                 if ddg < thermo_ddg_cutoff:
                     all_thermo_muts.append({
-                        'pos': pos, 'wt_aa': row['wildtype'], 'mut_aa': mut_aa, 'ddg': ddg
+                        'pos': pos, 'wt_aa': wt_aa, 'mut_aa': mut_aa, 'ddg': ddg
                     })
             os.remove(csv_path)
         except subprocess.CalledProcessError as e:
             st.error(f"**ThermoMPNN Crashed!**\n\nError Log:\n```\n{e.stderr}\n```")
             st.stop()
-            
+
         # Sort by most stabilizing (most negative ddG)
         all_thermo_muts = sorted(all_thermo_muts, key=lambda x: x['ddg'])
         thermo_records = build_single_and_combo_records(
@@ -754,7 +851,7 @@ def run_universal_developability_pipeline(
     if "ProteinMPNN (Soluble)" in gen_models:
         print(f" -> Running ProteinMPNN (Soluble Model) at Temperature {temp} on chains ({mpnn_chains_str})...")
         soluble_out_dir = os.path.join(run_dir, "soluble_mpnn_out")
-        
+
         soluble_cmd = [
             "python", PROTEIN_MPNN_SCRIPT,
             "--pdb_path", relaxed_pdb_path,
@@ -785,7 +882,7 @@ def run_universal_developability_pipeline(
                     rec.description = ""
                     soluble_records.append(rec)
                     sample_idx += 1
-                    
+
             if soluble_records:
                 SeqIO.write(soluble_records, os.path.join(run_dir, f"{run_name}_solublempnn.fasta"), "fasta")
                 all_raw_records.extend(soluble_records)
@@ -799,20 +896,21 @@ def run_universal_developability_pipeline(
         esmc_fasta = os.path.join(run_dir, f"{run_name}_esmc.fasta")
         cdr_str = ",".join(map(str, sorted(list(combined_frozen_0idx))))
         omit_set = set(omit_aas or [])
-        
+
         esmc_cmd = [
-            "conda", "run", "-n", ESMC_CONDA_ENV, 
+            "conda", "run", "-n", ESMC_CONDA_ENV,
             "python", "run_esmc_dms.py",
             "--sequence", clean_wt_full,
             "--cdr_indices", cdr_str,
             "--num_seqs", str(num_seqs),
-            "--out_fasta", esmc_fasta
+            "--out_fasta", esmc_fasta,
+            "--omit_aas", "".join(omit_aas or [])
         ]
         try:
             subprocess.run(esmc_cmd, check=True, capture_output=True, text=True)
             if os.path.exists(esmc_fasta):
                 raw_esmc = list(SeqIO.parse(esmc_fasta, "fasta"))
-                
+
                 # Extract ranked single point mutations from the ESM-C DMS output
                 esmc_single_muts = []
                 for rec in raw_esmc:
@@ -855,17 +953,19 @@ def run_universal_developability_pipeline(
         else:
             print(f" -> Running AbLang2 Masked-Marginal Generator across {len(antibody_units)} antibody unit(s)...")
             import ablang2
+            ablang = None
             try:
                 ablang = ablang2.pretrained(model_to_use="ablang2-paired", random_init=False)
-                alphabet = list("ACDEFGHIKLMNPQRSTVWY")
                 omit_set = set(omit_aas or [])
                 ablang_muts = []
+                aa_col_map = None
 
                 for ch_heavy, ch_light in antibody_units:
                     h_seq = chains[ch_heavy]
                     l_seq = chains[ch_light] if ch_light is not None else ""
                     frozen_h_0idx = {p - 1 for p in fixed_positions_map.get(ch_heavy, [])}
                     h_len = len(h_seq)
+                    l_len = len(l_seq)
 
                     # 1. Scan Heavy / VHH Chain
                     for i in range(h_len):
@@ -874,15 +974,22 @@ def run_universal_developability_pipeline(
                         wt_aa = h_seq[i]
                         masked_vh = h_seq[:i] + "*" + h_seq[i+1:]
                         res = ablang([[masked_vh, l_seq]], mode='probability')
-                        probs = res[0][i]
-                        wt_idx = alphabet.index(wt_aa) if wt_aa in alphabet else None
-                        if wt_idx is None:
+                        res_arr = res[0]
+                        if aa_col_map is None:
+                            aa_col_map = _get_ablang_aa_map(ablang, res_arr.shape[-1])
+                        if wt_aa not in aa_col_map:
                             continue
-                        wt_prob = probs[wt_idx]
-                        for mut_idx, mut_aa in enumerate(alphabet):
+
+                        tok_idx = _get_ablang_mask_index(
+                            ablang, [masked_vh, l_seq], len(res_arr),
+                            is_light=False, local_pos=i, h_len=h_len, l_len=l_len
+                        )
+                        probs = res_arr[tok_idx]
+                        wt_prob = float(probs[aa_col_map[wt_aa]])
+                        for mut_aa, mut_idx in aa_col_map.items():
                             if mut_aa == wt_aa or mut_aa in omit_set:
                                 continue
-                            delta_p = probs[mut_idx] - wt_prob
+                            delta_p = float(probs[mut_idx]) - wt_prob
                             if delta_p > 0:
                                 ablang_muts.append({
                                     'global_pos': chain_offsets[ch_heavy] + i,
@@ -892,21 +999,28 @@ def run_universal_developability_pipeline(
                     # 2. Scan Light Chain (if paired VL exists)
                     if ch_light is not None:
                         frozen_l_0idx = {p - 1 for p in fixed_positions_map.get(ch_light, [])}
-                        for i in range(len(l_seq)):
+                        for i in range(l_len):
                             if i in frozen_l_0idx:
                                 continue
                             wt_aa = l_seq[i]
                             masked_vl = l_seq[:i] + "*" + l_seq[i+1:]
                             res = ablang([[h_seq, masked_vl]], mode='probability')
-                            probs = res[0][h_len + i]
-                            wt_idx = alphabet.index(wt_aa) if wt_aa in alphabet else None
-                            if wt_idx is None:
+                            res_arr = res[0]
+                            if aa_col_map is None:
+                                aa_col_map = _get_ablang_aa_map(ablang, res_arr.shape[-1])
+                            if wt_aa not in aa_col_map:
                                 continue
-                            wt_prob = probs[wt_idx]
-                            for mut_idx, mut_aa in enumerate(alphabet):
+
+                            tok_idx = _get_ablang_mask_index(
+                                ablang, [h_seq, masked_vl], len(res_arr),
+                                is_light=True, local_pos=i, h_len=h_len, l_len=l_len
+                            )
+                            probs = res_arr[tok_idx]
+                            wt_prob = float(probs[aa_col_map[wt_aa]])
+                            for mut_aa, mut_idx in aa_col_map.items():
                                 if mut_aa == wt_aa or mut_aa in omit_set:
                                     continue
-                                delta_p = probs[mut_idx] - wt_prob
+                                delta_p = float(probs[mut_idx]) - wt_prob
                                 if delta_p > 0:
                                     ablang_muts.append({
                                         'global_pos': chain_offsets[ch_light] + i,
@@ -928,20 +1042,26 @@ def run_universal_developability_pipeline(
             except Exception as e:
                 st.error(f"**AbLang2 Crashed!**\n\nError Log:\n```\n{str(e)}\n```")
                 st.stop()
+            finally:
+                if ablang is not None:
+                    del ablang
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
     # ---------------------------------------------------------
     # STEP 5: Post-Filtering (Mask Enforcement, Mutation Cap) & Deduplication
     # ---------------------------------------------------------
     camsol_fasta_path = os.path.join(run_dir, f"{run_name}_camsol_upload.fasta")
     print(f"Step 5: Enforcing frozen regions, max_muts={max_muts_per_seq}, and pooling -> {camsol_fasta_path}")
-    
+
     wt_record = SeqRecord(Seq(clean_wt_full), id=f"{run_name}_WT", description="")
     cleaned_records = [wt_record]
-    
+
     # Map clean_seq -> SeqRecord so we can track or merge duplicate hits across models
     seq_to_record = {clean_wt_full: wt_record}
     duplicate_count = 0
-    
+
     for record in all_raw_records:
         raw_seq = str(record.seq).replace(":", "").replace("/", "")
         # Enforce exact user-defined frozen positions, banned AAs, and max mutation count
@@ -953,7 +1073,7 @@ def run_universal_developability_pipeline(
             max_muts_per_seq=max_muts_per_seq,
             rng=rng
         )
-        
+
         if filtered_seq not in seq_to_record:
             new_rec = SeqRecord(Seq(filtered_seq), id=record.id, description="")
             seq_to_record[filtered_seq] = new_rec
@@ -973,13 +1093,14 @@ def run_universal_developability_pipeline(
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
+
 def score_universal_variants(run_dir: str, run_name: str, wt_sequence: str):
     """
     Universal Phase 2 scoring engine handling N-chain biophysics, PyRosetta,
     per-domain PLMs, and the Agnostic Gated + Invariant developability score.
     """
     print(f"--- Phase 2: Scoring Universal Variants for {run_name} ---")
-    
+
     final_csv_path = os.path.join(run_dir, f"{run_name}_developability_metrics.csv")
     metadata_path = os.path.join(run_dir, f"{run_name}_metadata.json")
     raw_fasta_path = os.path.join(run_dir, f"{run_name}_camsol_upload.fasta")
@@ -987,12 +1108,26 @@ def score_universal_variants(run_dir: str, run_name: str, wt_sequence: str):
 
     if not os.path.exists(metadata_path):
         raise FileNotFoundError(f"Metadata missing for {run_name}. Re-run Phase 1.")
-        
+
     with open(metadata_path, "r") as f:
         meta = json.load(f)
         chain_lengths = meta["chain_lengths"]
         chain_roles = meta["chain_roles"]
+        chain_names = meta.get("chain_names", {})
         protein_format = meta.get("protein_format", "scFv (Single-chain Fv)")
+
+    # Build collision-free per-chain column suffixes (e.g., VH/VL or VH_1/VL_1/VH_2/VL_2)
+    raw_labels = {
+        c_id: str(chain_names.get(c_id) or chain_roles.get(c_id) or c_id).strip()
+        for c_id in chain_lengths
+    }
+    label_counts = {}
+    for lbl in raw_labels.values():
+        label_counts[lbl] = label_counts.get(lbl, 0) + 1
+    chain_col_labels = {
+        c_id: (f"{lbl}_{c_id}" if label_counts[lbl] > 1 else lbl)
+        for c_id, lbl in raw_labels.items()
+    }
 
     records = list(SeqIO.parse(raw_fasta_path, "fasta"))
     clean_wt = wt_sequence.replace(":", "").replace("/", "")
@@ -1040,13 +1175,13 @@ def score_universal_variants(run_dir: str, run_name: str, wt_sequence: str):
     for i, record in enumerate(records):
         unique_id = f"{run_name}_WT" if i == 0 else record.id
         seq = str(record.seq).replace(":", "").replace("/", "")
-        
+
         # Store primary VH/VHH and VL for table display (multi-arm scoring uses slice_chain directly)
         primary_vh_id = vh_chains[0] if vh_chains else (vhh_chains[0] if vhh_chains else None)
         primary_vl_id = vl_chains[0] if vl_chains else None
         vh_seq = slice_chain(seq, primary_vh_id) if primary_vh_id else None
         vl_seq = slice_chain(seq, primary_vl_id) if primary_vl_id else None
-        
+
         # Calculate mutations relative to WT
         mutations = []
         if seq == clean_wt:
@@ -1056,20 +1191,20 @@ def score_universal_variants(run_dir: str, run_name: str, wt_sequence: str):
                 if wt_aa != mut_aa:
                     mutations.append(f"{wt_aa}{idx+1}{mut_aa}")
             mut_string = ",".join(mutations) if mutations else "WT"
-            
+
         variant_entry = {
-            "id": unique_id, 
-            "mutations": mut_string, 
+            "id": unique_id,
+            "mutations": mut_string,
             "full_sequence": seq,
             "VH": vh_seq,
             "VL": vl_seq
         }
-        
+
         # Calculate per-chain local mutations dynamically (1-indexed starting at 1 per chain)
         for c_id, (s_idx, e_idx, role) in chain_bounds.items():
             wt_c_seq = clean_wt[s_idx:e_idx]
             mut_c_seq = seq[s_idx:e_idx]
-            
+
             c_mutations = []
             if mut_c_seq == wt_c_seq:
                 c_mut_string = "WT"
@@ -1078,10 +1213,9 @@ def score_universal_variants(run_dir: str, run_name: str, wt_sequence: str):
                     if wt_aa != mut_aa:
                         c_mutations.append(f"{wt_aa}{idx+1}{mut_aa}")
                 c_mut_string = ",".join(c_mutations) if c_mutations else "WT"
-                
-            role_suffix = str(role).strip() if role else str(c_id)
-            variant_entry[f"mutations_{role_suffix}"] = c_mut_string
-            
+
+            variant_entry[f"mutations_{chain_col_labels[c_id]}"] = c_mut_string
+
         variants.append(variant_entry)
 
     df = pd.DataFrame(variants)
@@ -1095,7 +1229,8 @@ def score_universal_variants(run_dir: str, run_name: str, wt_sequence: str):
             # Drop previous normalized/composite columns so they get cleanly recomputed
             cols_to_drop = [
                 c for c in cached_df.columns
-                if c.endswith('_norm') or c.startswith('z_') or c.startswith('raw_') or c in [
+                if c.endswith('_norm') or c.startswith('z_') or c.startswith('raw_')
+                or c.startswith('mutations_') or c in [
                     'global_composite_score', 'agnostic_gated_score', 'legacy_linear_score',
                     'passed_all_gates', 'gate_status', 'source_model',
                     'pi_delta', 'protein_format', 'num_mutations'
@@ -1188,7 +1323,7 @@ def score_universal_variants(run_dir: str, run_name: str, wt_sequence: str):
     if 'gravy' not in df.columns: df['gravy'] = np.nan
     if 'net_charge' not in df.columns: df['net_charge'] = np.nan
     if 'charge_asymmetry' not in df.columns: df['charge_asymmetry'] = np.nan
-    
+
     mask = df['pI'].isna() | df['gravy'].isna() | df['net_charge'].isna() | (has_paired_fv & df['charge_asymmetry'].isna())
     if mask.any():
         print(f"Calculating sequence biophysics for {mask.sum()} variants...")
@@ -1198,7 +1333,7 @@ def score_universal_variants(run_dir: str, run_name: str, wt_sequence: str):
             df.at[idx, 'net_charge'] = full_analysis.charge_at_pH(7.4)
             df.at[idx, 'pI'] = full_analysis.isoelectric_point()
             df.at[idx, 'gravy'] = full_analysis.gravy()
-            
+
             # Compute mean VH-VL dipole across all paired Fv arms (supports both 2-chain Fv and 4-chain Bispecifics)
             if has_paired_fv:
                 arm_dipoles = []
@@ -1213,7 +1348,7 @@ def score_universal_variants(run_dir: str, run_name: str, wt_sequence: str):
                     df.at[idx, 'charge_asymmetry'] = float(np.mean(arm_dipoles))
     else:
         print(" -> Sequence biophysics up to date.")
-        
+
     df['pi_delta'] = (df['pI'] - 7.4).abs()
 
     # ---------------------------------------------------------
@@ -1221,21 +1356,21 @@ def score_universal_variants(run_dir: str, run_name: str, wt_sequence: str):
     # ---------------------------------------------------------
     if 'pyrosetta_ddg' not in df.columns: df['pyrosetta_ddg'] = np.nan
     mask = df['pyrosetta_ddg'].isna()
-    
+
     if mask.any():
         print(f"Calculating PyRosetta for {mask.sum()} missing variants...")
         relaxed_pdb_path = os.path.join(run_dir, f"{run_name}_relaxed.pdb")
-        
+
         if os.path.exists(relaxed_pdb_path):
-            safe_init_pyrosetta()  
+            safe_init_pyrosetta()
             import pyrosetta
-            from pyrosetta.toolbox import mutate_residue 
+            from pyrosetta.toolbox import mutate_residue
 
             wt_pose = pyrosetta.pose_from_file(relaxed_pdb_path)
             scorefxn = pyrosetta.get_fa_scorefxn()
             wt_energy = scorefxn(wt_pose)
             pose_length = wt_pose.total_residue()
-            
+
             for idx, row in df[mask].iterrows():
                 if row['mutations'] == "WT":
                     df.at[idx, 'pyrosetta_ddg'] = 0.0
@@ -1247,9 +1382,8 @@ def score_universal_variants(run_dir: str, run_name: str, wt_sequence: str):
                         m = m.strip()
                         if not m: continue
                         pos, mut_aa = int(m[1:-1]), m[-1]
-                        
+
                         if 1 <= pos <= pose_length:
-                            # Safeguard prevents C++ corruption
                             if mut_pose.residue(pos).name3() == "CYS" and mut_pose.residue(pos).has_variant_type(pyrosetta.rosetta.core.chemical.DISULFIDE):
                                 print(f" -> Skipping {m}: Protects C++ core from disulfide segfault.")
                                 continue
@@ -1262,26 +1396,25 @@ def score_universal_variants(run_dir: str, run_name: str, wt_sequence: str):
                     print(f" -> PyRosetta warning for {row['mutations'][:30]}... : {e}")
                     df.at[idx, 'pyrosetta_ddg'] = 0.0
                 finally:
-                    # Now safe to clear because the C++ object is never corrupted!
                     mut_pose.clear()
                     del mut_pose
-                    
+
             # Clear the WT pose and flush the RAM
             wt_pose.clear()
             del wt_pose
-            gc.collect() 
+            gc.collect()
         else:
             df['pyrosetta_ddg'] = 0.0
     else:
         print(" -> PyRosetta metrics up to date. Skipping model.")
-        
+
     # ---------------------------------------------------------
     # 6. PLM 1: AntiBERTy (Per-Chain Antibody Fitness — Safe for 4-Chain Bispecifics)
     # ---------------------------------------------------------
     if has_any_ab_domain:
         if 'antiberty_fitness' not in df.columns: df['antiberty_fitness'] = np.nan
         mask = df['antiberty_fitness'].isna()
-        
+
         if mask.any():
             print(f"Loading AntiBERTy to score {mask.sum()} missing antibody variants per domain...")
             ab_tokenizer = AutoTokenizer.from_pretrained("jeffruffolo/AntiBERTy")
@@ -1294,7 +1427,7 @@ def score_universal_variants(run_dir: str, run_name: str, wt_sequence: str):
                 if row['mutations'] == "WT":
                     df.at[idx, 'antiberty_fitness'] = 0.0
                     continue
-                    
+
                 mut_delta_logp = 0.0
                 for m in row['mutations'].split(","):
                     m = m.strip()
@@ -1308,22 +1441,23 @@ def score_universal_variants(run_dir: str, run_name: str, wt_sequence: str):
                         if local_pos >= len(masked_chain) or len(masked_chain) > 508:
                             continue
                         masked_chain[local_pos] = "[MASK]"
-                        
+
                         inputs = ab_tokenizer(" ".join(masked_chain), return_tensors="pt").to(device)
                         with torch.no_grad():
                             logits = ab_model(**inputs).logits
                             log_probs = torch.log_softmax(logits[0, local_pos + 1], dim=-1)
                             mut_delta_logp += (
-                                log_probs[ab_tokenizer.convert_tokens_to_ids(mut_aa)] - 
+                                log_probs[ab_tokenizer.convert_tokens_to_ids(mut_aa)] -
                                 log_probs[ab_tokenizer.convert_tokens_to_ids(wt_aa)]
                             ).item()
                     except Exception as ex:
                         print(f" -> AntiBERTy warning on {m}: {ex}")
                 df.at[idx, 'antiberty_fitness'] = mut_delta_logp
-                
+
             del ab_model, ab_tokenizer
             gc.collect()
-            torch.cuda.empty_cache()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         else:
             print(" -> AntiBERTy metrics up to date.")
 
@@ -1333,24 +1467,24 @@ def score_universal_variants(run_dir: str, run_name: str, wt_sequence: str):
     if has_any_ab_domain:
         if 'ablang_fitness' not in df.columns: df['ablang_fitness'] = np.nan
         mask = df['ablang_fitness'].isna()
-        
+
         if mask.any():
             print(f"Loading AbLang2 to score {mask.sum()} missing variants across {len(all_antibody_units)} antibody unit(s)...")
             import ablang2
             ablang_model = ablang2.pretrained("ablang2-paired", random_init=False) 
-            
+
             # Precompute WT baseline score for each antibody unit
             wt_unit_scores = []
             for h_id, l_id in all_antibody_units:
                 wt_h = slice_chain(clean_wt, h_id)
                 wt_l = slice_chain(clean_wt, l_id) if l_id is not None else ""
                 wt_unit_scores.append(float(ablang_model([[wt_h, wt_l]], mode='pseudo_log_likelihood')[0]))
-            
+
             for idx, row in df[mask].iterrows():
                 if row['mutations'] == "WT":
                     df.at[idx, 'ablang_fitness'] = 0.0
                     continue
-                    
+
                 full_s = row['full_sequence']
                 total_ablang_delta = 0.0
                 for unit_idx, (h_id, l_id) in enumerate(all_antibody_units):
@@ -1358,12 +1492,13 @@ def score_universal_variants(run_dir: str, run_name: str, wt_sequence: str):
                     mut_l = slice_chain(full_s, l_id) if l_id is not None else ""
                     mut_s = float(ablang_model([[mut_h, mut_l]], mode='pseudo_log_likelihood')[0])
                     total_ablang_delta += (mut_s - wt_unit_scores[unit_idx])
-                    
+
                 df.at[idx, 'ablang_fitness'] = total_ablang_delta
 
             del ablang_model
             gc.collect()
-            torch.cuda.empty_cache()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         else:
             print(" -> AbLang2 metrics up to date.")
 
@@ -1372,10 +1507,10 @@ def score_universal_variants(run_dir: str, run_name: str, wt_sequence: str):
     # ---------------------------------------------------------
     if 'protbert_fitness' not in df.columns: df['protbert_fitness'] = np.nan
     mask = df['protbert_fitness'].isna()
-    
+
     if mask.any():
         print(f"Loading ProtBERT to score {mask.sum()} missing variants...")
-        pb_tokenizer = AutoTokenizer.from_pretrained("Rostlab/prot_bert")
+        pb_tokenizer = AutoTokenizer.from_pretrained("Rostlab/prot_bert", do_lower_case=False)
         pb_model = AutoModelForMaskedLM.from_pretrained("Rostlab/prot_bert").to(device)
         pb_model.eval()
 
@@ -1383,7 +1518,7 @@ def score_universal_variants(run_dir: str, run_name: str, wt_sequence: str):
             if row['mutations'] == "WT":
                 df.at[idx, 'protbert_fitness'] = 0.0
                 continue
-                
+
             mut_delta_logp = 0.0
             for m in row['mutations'].split(","):
                 m = m.strip()
@@ -1392,22 +1527,24 @@ def score_universal_variants(run_dir: str, run_name: str, wt_sequence: str):
                     wt_aa, pos, mut_aa = m[0], int(m[1:-1]) - 1, m[-1]
                     if pos >= len(wt_list): continue
                     masked_seq = wt_list.copy()
-                    masked_seq[pos] = "[MASK]" 
-                    
+                    masked_seq[pos] = "[MASK]"
+
                     inputs = pb_tokenizer(" ".join(masked_seq), return_tensors="pt").to(device)
                     with torch.no_grad():
                         logits = pb_model(**inputs).logits
                         log_probs = torch.log_softmax(logits[0, pos + 1], dim=-1)
                         mut_delta_logp += (
-                            log_probs[pb_tokenizer.convert_tokens_to_ids(mut_aa)] - 
+                            log_probs[pb_tokenizer.convert_tokens_to_ids(mut_aa)] -
                             log_probs[pb_tokenizer.convert_tokens_to_ids(wt_aa)]
                         ).item()
-                except Exception: pass
+                except Exception:
+                    pass
             df.at[idx, 'protbert_fitness'] = mut_delta_logp
 
         del pb_model, pb_tokenizer
         gc.collect()
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     else:
         print(" -> ProtBERT metrics up to date.")
 
@@ -1416,18 +1553,18 @@ def score_universal_variants(run_dir: str, run_name: str, wt_sequence: str):
     # ---------------------------------------------------------
     if 'esm_fitness' not in df.columns: df['esm_fitness'] = np.nan
     if 'bindpred_kd' not in df.columns: df['bindpred_kd'] = np.nan
-    
+
     # Separate masks so VHHs/Enzymes (where bindpred_kd is NaN) don't invalidate the ESM-2 cache!
     mask_esm = df['esm_fitness'].isna()
     mask_bp = df['bindpred_kd'].isna() if has_paired_fv else pd.Series(False, index=df.index)
     mask = mask_esm | mask_bp
-    
+
     if mask.any():
         print(f"Loading ESM-2 & BINDPRED to score {mask.sum()} missing variants...")
         import esm
         from huggingface_hub import hf_hub_download
         from catboost import CatBoostRegressor
-        
+
         model_esm, alphabet_esm = esm.pretrained.esm2_t33_650M_UR50D()
         model_esm = model_esm.to(device)
         batch_converter_esm = alphabet_esm.get_batch_converter()
@@ -1475,7 +1612,7 @@ def score_universal_variants(run_dir: str, run_name: str, wt_sequence: str):
                             if pos >= len(wt_list): continue
                             masked_seq = wt_list.copy()
                             masked_seq[pos] = "<mask>"
-                            
+
                             _, _, mask_tokens = batch_converter_esm([("seq", "".join(masked_seq))])
                             with torch.no_grad():
                                 log_probs = torch.log_softmax(model_esm(mask_tokens.to(device))["logits"][0, pos + 1], dim=-1)
@@ -1483,12 +1620,14 @@ def score_universal_variants(run_dir: str, run_name: str, wt_sequence: str):
                                     log_probs[alphabet_esm.tok_to_idx[mut_aa]] -
                                     log_probs[alphabet_esm.tok_to_idx[wt_aa]]
                                 ).item()
-                        except Exception: pass
+                        except Exception:
+                            pass
                     df.at[idx, 'esm_fitness'] = mut_delta_logp
-                
+
         del model_esm, bindpred_model
         gc.collect()
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     else:
         print(" -> ESM-2 & BINDPRED metrics up to date.")
 
@@ -1497,10 +1636,9 @@ def score_universal_variants(run_dir: str, run_name: str, wt_sequence: str):
     # ---------------------------------------------------------
     if 'poet2_fitness' not in df.columns: df['poet2_fitness'] = np.nan
     mask = df['poet2_fitness'].isna()
-    
+
     if False:  # Retained exactly as requested
         print(f"Calling OpenProtein API (POET-2) to score {mask.sum()} missing variants...")
-        
         try:
             import openprotein
             
@@ -1508,74 +1646,70 @@ def score_universal_variants(run_dir: str, run_name: str, wt_sequence: str):
             op_user = os.environ.get("OPENPROTEIN_USERNAME")
             op_pass = os.environ.get("OPENPROTEIN_PASSWORD")
             session = openprotein.connect(username=op_user, password=op_pass)
-            
+
             # Gather WT and variants (WT must be first for relative scoring)
             seqs = [clean_wt]
             index_mapping = []
-            
             for idx, row in df[mask].iterrows():
                 if row['mutations'] != "WT":
                     seqs.append(row['full_sequence'])
                     index_mapping.append(idx)
-                    
+
             if len(seqs) > 1:
                 # 2. Create MSA exactly as the tutorial outlines
                 print(" -> Creating MSA...")
                 msa = session.align.create_msa(clean_wt.encode())
                 msa.wait()
-                
+
                 # 3. Sample Prompt
                 print(" -> Generating Evolutionary Prompt...")
                 prompt = msa.sample_prompt(num_ensemble_prompts=1, random_seed=42)
                 prompt.wait()
-                
+
                 # 4. Score Sequences
                 print(f" -> Submitting PoET scoring job for {len(seqs)} sequences...")
                 poet = session.embedding.get_model("poet")
                 scorejob = poet.score(prompt=prompt.prompt_id, sequences=seqs)
                 score_results = scorejob.wait()
-                
+
                 # 5. Process Results
                 # NB: one score per prompt. We used 1 ensemble prompt, so results are in index 0.
                 scores = score_results[0]
-                
+
                 # Helper to safely extract the numeric score regardless of API return type
                 def get_val(s):
                     if hasattr(s, 'score'): return s.score
                     if hasattr(s, 'log_likelihood'): return s.log_likelihood
                     if isinstance(s, dict) and 'log_likelihood' in s: return s['log_likelihood']
                     return float(s)
-                
+
                 wt_score = get_val(scores[0])
-                
                 for idx, mut_score_obj in zip(index_mapping, scores[1:]):
                     df.at[idx, 'poet2_fitness'] = get_val(mut_score_obj) - wt_score
-                    
+
                 if "WT" in df.loc[mask, 'mutations'].values:
                     df.loc[mask & (df['mutations'] == "WT"), 'poet2_fitness'] = 0.0
-                    
                 print(" -> POET API scoring complete.")
             else:
                 df.loc[mask & (df['mutations'] == "WT"), 'poet2_fitness'] = 0.0
-                
         except Exception as e:
             print(f" -> WARNING: OpenProtein API call failed: {e}")
     else:
         print(" -> POET metrics up to date. Skipping API call.")
-    
+
     # ---------------------------------------------------------
-    # 11. PLM 6: ESM-C (Biohub 300M via Isolated Env)
+    # 11. PLM 6: ESM-C (Biohub 600M via Isolated Env)
     # ---------------------------------------------------------
     if 'esmc_fitness' not in df.columns: df['esmc_fitness'] = np.nan
     mask = df['esmc_fitness'].isna()
-    
+
     if mask.any():
         print(f"Running ESM-C in isolated env to score {mask.sum()} missing variants...")
         temp_in_csv = os.path.join(run_dir, "temp_esmc_in.csv")
         temp_out_csv = os.path.join(run_dir, "temp_esmc_out.csv")
-        
+
         df.loc[mask, ['id', 'mutations']].to_csv(temp_in_csv, index=False)
-        
+
         esmc_score_cmd = [
             "conda", "run", "-n", ESMC_CONDA_ENV,
             "python", "run_esmc_scoring.py",
@@ -1603,7 +1737,7 @@ def score_universal_variants(run_dir: str, run_name: str, wt_sequence: str):
     # ---------------------------------------------------------
     if 'janus_ddg' not in df.columns: df['janus_ddg'] = np.nan
     mask = df['janus_ddg'].isna()
-    
+
     if mask.any():
         print(f"Running JanusDDG for {mask.sum()} missing variants...")
         if JANUS_SRC_PATH not in sys.path:
@@ -1611,26 +1745,26 @@ def score_universal_variants(run_dir: str, run_name: str, wt_sequence: str):
         try:
             import utils
             utils.MODELS_DIR = JANUS_MODELS_DIR
-            
+
             temp_csv_path = os.path.join(run_dir, "temp_janus_input.csv")
             subset_to_compute = df[mask & (df['mutations'] != "WT")]
-            
+
             if len(subset_to_compute) > 0:
                 pd.DataFrame({
-                    'ID': subset_to_compute['id'], 
-                    'Sequence': clean_wt, 
+                    'ID': subset_to_compute['id'],
+                    'Sequence': clean_wt,
                     'MTS': subset_to_compute['mutations'].str.replace(",", "_")
                 }).to_csv(temp_csv_path, index=False)
-                
+
                 import __main__
                 import model as janus_model
                 import esm
-                
+
                 model_esm, alphabet_esm = esm.pretrained.esm2_t33_650M_UR50D()
                 model_esm = model_esm.to(device)
                 batch_converter_esm = alphabet_esm.get_batch_converter()
                 model_esm.eval()
-                
+
                 janus_model.device = device
                 setattr(__main__, 'Cross_Attention_DDG', janus_model.Cross_Attention_DDG)
                 setattr(__main__, 'TransformerRegression', janus_model.TransformerRegression)
@@ -1645,16 +1779,17 @@ def score_universal_variants(run_dir: str, run_name: str, wt_sequence: str):
                 finally:
                     # Restore original torch.load behavior
                     torch.load = _orig_load
-                # ---------------------------------------
+
                 pred_dir, _ = utils.process_and_predict(temp_csv_path, model_janus, model_esm, batch_converter_esm, device)
-                
+
                 janus_mapping = dict(zip(subset_to_compute['id'], pred_dir.values))
                 df.loc[mask, 'janus_ddg'] = df.loc[mask, 'id'].map(janus_mapping).fillna(0.0)
                 os.remove(temp_csv_path)
-                
+
                 del model_esm, model_janus
                 gc.collect()
-                torch.cuda.empty_cache()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
             else:
                 df.loc[mask, 'janus_ddg'] = 0.0
         except Exception as e:
@@ -1666,7 +1801,7 @@ def score_universal_variants(run_dir: str, run_name: str, wt_sequence: str):
     # Safely Initialize Missing Columns to Prevent UI Plot Crashes
     # ---------------------------------------------------------
     expected_cols = [
-        'janus_ddg', 'esm_fitness', 'esmc_fitness', 'antiberty_fitness', 
+        'janus_ddg', 'esm_fitness', 'esmc_fitness', 'antiberty_fitness',
         'ablang_fitness', 'protbert_fitness', 'poet2_fitness', 'bindpred_kd', 'charge_asymmetry'
     ]
     for col in expected_cols:
@@ -1799,20 +1934,22 @@ def score_universal_variants(run_dir: str, run_name: str, wt_sequence: str):
         by=['passed_all_gates', 'agnostic_gated_score'],
         ascending=[False, False]
     ).reset_index(drop=True)
-    
-    # 5. Clean up columns for the final CSV layout
+
+    # 5. Clean up columns for the final CSV layout (per-chain mutations_* placed upfront)
+    mut_cols = [c for c in df.columns if c.startswith('mutations_')]
     ordered_cols = [
         'id', 'source_model', 'protein_format', 'num_mutations',
+        *mut_cols,
         'agnostic_gated_score', 'global_composite_score', 'passed_all_gates', 'gate_status',
         'janus_ddg', 'pyrosetta_ddg', 'camsol_score', 'pI', 'pi_delta', 'gravy', 'net_charge',
-        'charge_asymmetry', 'bindpred_kd', 'esm_fitness', 'antiberty_fitness', 
+        'charge_asymmetry', 'bindpred_kd', 'esm_fitness', 'antiberty_fitness',
         'ablang_fitness', 'protbert_fitness', 'poet2_fitness', 'esmc_fitness', 'full_sequence'
     ]
     cols_to_save = [c for c in ordered_cols if c in df.columns] + [
-        c for c in df.columns if c.endswith('_norm') or c.startswith('mutations_') or c in ['VH', 'VL']
+        c for c in df.columns if (c.endswith('_norm') or c in ['VH', 'VL']) and c not in ordered_cols
     ]
-    
+
     df[cols_to_save].to_csv(final_csv_path, index=False)
     print(f"Scoring complete for format '{protein_format}'. Results saved to {final_csv_path}")
-    
+
     return df

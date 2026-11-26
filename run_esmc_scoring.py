@@ -5,6 +5,7 @@ import torch
 import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoModelForMaskedLM
 
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--wt_seq", required=True, type=str)
@@ -18,11 +19,16 @@ def main():
     # 1. Collect all unique 0-indexed positions mutated across the cohort
     unique_positions = set()
     for mut_str in df['mutations'].dropna():
-        if mut_str == "WT":
+        mut_clean = str(mut_str).strip()
+        if mut_clean == "WT" or not mut_clean:
             continue
-        for m in str(mut_str).split(","):
+        for m in mut_clean.split(","):
+            m = m.strip()
+            if not m:
+                continue
             pos = int(m[1:-1]) - 1
-            unique_positions.add(pos)
+            if 0 <= pos < len(clean_wt):
+                unique_positions.add(pos)
 
     # 2. Load the exact same Biohub HF checkpoint cached in Phase 1
     hf_id = "biohub/ESMC-600M-hf"
@@ -30,18 +36,30 @@ def main():
     model = AutoModelForMaskedLM.from_pretrained(hf_id).eval()
     mask_token_id = tokenizer.mask_token_id
 
-    if torch.cuda.is_available():
-        model = model.cuda()
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    if device == "cuda":
+        try:
+            amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+            model = model.to(device=device, dtype=amp_dtype)
+        except torch.OutOfMemoryError:
+            print(" -> GPU OOM detected. Falling back to CPU execution for ESM-C scoring...")
+            torch.cuda.empty_cache()
+            device = "cpu"
+            model = model.to(device=device, dtype=torch.float32)
+    else:
+        model = model.to(device=device, dtype=torch.float32)
 
     inputs = tokenizer(clean_wt, return_tensors="pt")
-    if torch.cuda.is_available():
-        inputs = {k: v.cuda() for k, v in inputs.items()}
+    inputs = {k: v.to(device) for k, v in inputs.items()}
 
-    # Find the start index after the <cls> token (typically index 1)
+    # Find the start index after special tokens (typically index 1)
     tokens = tokenizer.convert_ids_to_tokens(inputs["input_ids"][0])
+    special_tokens = set(tokenizer.all_special_tokens or [])
     seq_start_idx = 1
     for idx, tok in enumerate(tokens):
-        if tok.replace("<", "").replace(">", "").upper() == clean_wt[0].upper():
+        if tok in special_tokens:
+            continue
+        if tok.upper() == clean_wt[0].upper():
             seq_start_idx = idx
             break
 
@@ -59,14 +77,19 @@ def main():
     # 4. Sum the delta log-likelihood for each variant
     scores = []
     for _, row in df.iterrows():
-        mut_str = str(row['mutations'])
-        if mut_str == "WT" or not mut_str or mut_str == "nan":
+        mut_str = str(row['mutations']).strip()
+        if mut_str == "WT" or not mut_str or mut_str.lower() == "nan":
             scores.append(0.0)
             continue
 
         delta_log_p = 0.0
         for m in mut_str.split(","):
+            m = m.strip()
+            if not m:
+                continue
             wt_aa, pos, mut_aa = m[0], int(m[1:-1]) - 1, m[-1]
+            if pos not in pos_log_probs:
+                continue
             log_probs = pos_log_probs[pos]
             wt_tok_id = tokenizer.convert_tokens_to_ids(wt_aa)
             mut_tok_id = tokenizer.convert_tokens_to_ids(mut_aa)
@@ -76,6 +99,7 @@ def main():
 
     df['esmc_fitness'] = scores
     df[['id', 'esmc_fitness']].to_csv(args.output_csv, index=False)
+
 
 if __name__ == "__main__":
     main()
